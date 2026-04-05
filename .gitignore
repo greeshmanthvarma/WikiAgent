@@ -1,0 +1,23 @@
+# Cursor
+.cursor/
+
+# Workflow reference
+workflows.html
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Node
+node_modules/
+
+# Build outputs
+dist/
+build/
