@@ -1,3 +1,6 @@
+# macOS — folder metadata (icons, view options); not for version control
+.DS_Store
+
 # Cursor
 .cursor/
 
