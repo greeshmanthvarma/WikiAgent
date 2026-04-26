@@ -1,3 +1,6 @@
+import json
+from typing import Any
+
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -174,3 +177,47 @@ async def get_page_metadata(page_path: str, agent_id: int, db: AsyncSession) -> 
         "updated_at": page.updated_at.isoformat() if page.updated_at else None,
         "content_length": len(page.content or ""),
     }
+
+def _clamp_search_limit(raw: object) -> int:
+    try:
+        n = int(raw)  # convert the raw object to an integer
+    except (TypeError, ValueError):
+        n = 100 # default to 100 if the limit is not a valid integer
+    return max(1, min(n, 100)) # clamp the limit between 1 and 100
+
+
+async def execute_tool(tool_name: str, tool_args: dict[str, Any] | str, agent_id: int, db: AsyncSession) -> dict[str, Any]:
+    """Run one tool; returns ``{"result": ...}`` or ``{"error": "..."}``."""
+    try:
+        if isinstance(tool_args, str): # if the tool arguments are a string, load them as a JSON object
+            tool_args = json.loads(tool_args) if tool_args.strip() else {}
+        if not isinstance(tool_args, dict): # if the tool arguments are not a dictionary, return an error
+            return {"error": "tool arguments must be a JSON object"}
+
+        if tool_name == "read_page":
+            result = await read_page(tool_args["page_path"], agent_id, db)
+        elif tool_name == "list_pages":
+            result = await list_pages(agent_id, db)
+        elif tool_name == "write_page":
+            result = await write_page(tool_args["page_path"], tool_args["content"], agent_id, db)
+        elif tool_name == "delete_page":
+            result = await delete_page(tool_args["page_path"], agent_id, db)
+        elif tool_name == "search_pages":
+            limit = _clamp_search_limit(tool_args.get("limit", 100))
+            result = await search_pages(tool_args["search_query"], agent_id, db, limit=limit)
+        elif tool_name == "append_log_entry":
+            result = await append_log_entry(tool_args["log_entry"], agent_id, db)
+        elif tool_name == "page_exists":
+            result = await page_exists(tool_args["page_path"], agent_id, db)
+        elif tool_name == "get_page_metadata":
+            result = await get_page_metadata(tool_args["page_path"], agent_id, db)
+        else:
+            raise ValueError(f"unknown tool: {tool_name}")
+    except (ValueError, KeyError, json.JSONDecodeError) as e:
+        await db.rollback()
+        return {"error": str(e)}
+    except Exception as e:
+        await db.rollback()
+        return {"error": str(e)}
+
+    return {"result": result}
