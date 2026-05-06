@@ -9,7 +9,6 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from openai import OpenAI
 import os
 import asyncio
 from sqlalchemy import text
@@ -44,8 +43,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         content={"detail": f"Internal Server Error: {str(exc)}"},
     )
 
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 # Database will be initialized on startup
 from app.database import engine, Base
 
@@ -54,6 +51,13 @@ async def startup_event():
     # Create database tables
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    from app.agents import client as openai_async_client
+
+    await openai_async_client.close()
 
 
 @app.get("/")
