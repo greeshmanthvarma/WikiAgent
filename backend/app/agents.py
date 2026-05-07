@@ -6,10 +6,13 @@ from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import AsyncSession
 import json
 import time
+import logging
 load_dotenv()
 from app.tools import execute_tool
 
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+logger = logging.getLogger(__name__)
 
 
 _PAGE_PATH_DESC = (
@@ -19,6 +22,7 @@ _PAGE_PATH_DESC = (
 MAX_STEPS = 10
 TIMEOUT = 240
 TOOL_EXECUTION_TIMEOUT = 10
+TURN_API_TIMEOUT = 120
 MAX_RETRIES = 3
 
 MAIN_WIKI_AGENT_INSTRUCTIONS = """
@@ -28,11 +32,18 @@ Your job:
 - Answer questions using the wiki when tools help; prefer facts from stored pages over guessing.
 - Keep the wiki coherent: read before you write, and write in small, purposeful edits.
 
+Wiki layout and file discovery:
+- Page paths are wiki slugs (e.g. `schema`, `index`, `notes/topic`). An optional trailing `.md` on the last segment refers to the same page; tools normalize this.
+- **`schema`**: This wiki's conventions—structure, naming, and what belongs where. Read **schema** early before creating many new pages or reorganizing, so you follow this wiki's rules.
+- **`index`**: Catalog or map of important pages. Read **index** when orienting yourself or after substantive adds/removals so you can keep it truthful (or tell the user it needs an update).
+- **`log`**: Chronological operational history. Prefer **append_log_entry** for meaningful changes; avoid rewriting the whole log unless you are fixing a specific mistake.
+- **Finding pages**: Use **list_pages** for the sorted list of active paths. Use **search_pages** to find pages whose *bodies* match a substring. Use **read_page** for full text. Use **page_exists** or **get_page_metadata** when you only need existence, soft-delete status, or size without loading the full body.
+
 Tool discipline:
 - Use tools when you need current page content, a list of pages, search hits, or to change the wiki. Do not fabricate tool results or page text.
 - If unsure a path exists, use page_exists or get_page_metadata, or search_pages, before read_page / write_page.
 - Paths: lowercase wiki paths with "/" segments (e.g. notes/topic). No "." or ".." segments. Optional trailing ".md" on the last segment is allowed and means the same page.
-- Reserved pages: index, log, and schema have special roles. Do not delete them. Prefer append_log_entry for chronological notes instead of rewriting the whole log unless necessary.
+- Never delete the reserved pages **index**, **schema**, or **log**.
 - Soft-deleted pages may still exist; use get_page_metadata / page_exists if read_page or list_pages behave unexpectedly.
 
 Writing style:
@@ -219,6 +230,120 @@ def _event_item(event: object) -> dict | object:
     return getattr(event, "item")
 
 
+def _log_preview(s: str, limit: int = 200) -> str:
+    s = s.replace("\n", " ") # replace newlines with spaces
+    return s if len(s) <= limit else f"{s[:limit]}…({len(s)} chars)" # return the string if it's less than the limit, otherwise return the string up to the limit and an ellipsis
+
+_RESPONSE_LIFECYCLE_EVENT_TYPES = frozenset({
+    "response.completed",
+    "response.failed",
+    "response.incomplete",
+})
+
+
+def _event_response(event: object) -> object | None:
+    if isinstance(event, dict):
+        return event.get("response")
+    return getattr(event, "response", None)
+
+
+def _usage_summary(usage: object | None) -> dict[str, object] | None:
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        out_details = usage.get("output_tokens_details")
+        reasoning = None
+        if isinstance(out_details, dict):
+            reasoning = out_details.get("reasoning_tokens")
+        return {
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "reasoning_tokens": reasoning,
+        }
+    out_details = getattr(usage, "output_tokens_details", None)
+    reasoning = None
+    if isinstance(out_details, dict):
+        reasoning = out_details.get("reasoning_tokens")
+    elif out_details is not None:
+        reasoning = getattr(out_details, "reasoning_tokens", None)
+    return {
+        "input_tokens": getattr(usage, "input_tokens", None),
+        "output_tokens": getattr(usage, "output_tokens", None),
+        "total_tokens": getattr(usage, "total_tokens", None),
+        "reasoning_tokens": reasoning,
+    }
+
+
+def _log_response_lifecycle(agent_id: int, phase: str, event: object) -> None:
+    event_type = _event_type(event)
+    resp = _event_response(event)
+    if resp is None:
+        logger.warning(
+            "response lifecycle event missing response payload (agent_id=%s phase=%s type=%s)",
+            agent_id,
+            phase,
+            event_type,
+        )
+        return
+    rid = resp.get("id") if isinstance(resp, dict) else getattr(resp, "id", None)
+    model = resp.get("model") if isinstance(resp, dict) else getattr(resp, "model", None)
+    status = resp.get("status") if isinstance(resp, dict) else getattr(resp, "status", None)
+
+    if event_type == "response.completed":
+        usage = resp.get("usage") if isinstance(resp, dict) else getattr(resp, "usage", None)
+        logger.info(
+            "response completed (agent_id=%s phase=%s response_id=%s model=%s status=%s usage=%s)",
+            agent_id,
+            phase,
+            rid,
+            model,
+            status,
+            _usage_summary(usage),
+        )
+    elif event_type == "response.failed":
+        err = resp.get("error") if isinstance(resp, dict) else getattr(resp, "error", None)
+        code = message = None
+        if isinstance(err, dict):
+            code = err.get("code")
+            message = err.get("message")
+        elif err is not None:
+            code = getattr(err, "code", None)
+            message = getattr(err, "message", None)
+        logger.error(
+            "response failed (agent_id=%s phase=%s response_id=%s model=%s code=%s message=%s)",
+            agent_id,
+            phase,
+            rid,
+            model,
+            code,
+            message,
+        )
+    elif event_type == "response.incomplete":
+        inc = resp.get("incomplete_details") if isinstance(resp, dict) else getattr(resp, "incomplete_details", None)
+        reason = None
+        if isinstance(inc, dict):
+            reason = inc.get("reason")
+        elif inc is not None:
+            reason = getattr(inc, "reason", None)
+        logger.warning(
+            "response incomplete (agent_id=%s phase=%s response_id=%s model=%s status=%s reason=%s)",
+            agent_id,
+            phase,
+            rid,
+            model,
+            status,
+            reason,
+        )
+    else:
+        logger.warning(
+            "unexpected response lifecycle event (agent_id=%s phase=%s type=%s)",
+            agent_id,
+            phase,
+            event_type,
+        )
+
+
 async def run_agent_loop(
     agent_id: int,
     query: str,
@@ -236,33 +361,76 @@ async def run_agent_loop(
     while True:
 
         if time.time() - t0 > TIMEOUT:
+            logger.error("agent loop exceeded TIMEOUT (agent_id=%s, limit_s=%s)", agent_id, TIMEOUT)
             raise TimeoutError("Agent loop exceeded TIMEOUT")
         
         if MAX_STEPS > 0 and tool_rounds >= MAX_STEPS:
-            stream = None
+            logger.info(
+                "agent synthesis turn (agent_id=%s, tool_rounds=%s, max_steps=%s)",
+                agent_id,
+                tool_rounds,
+                MAX_STEPS,
+            )
             for attempt in range(MAX_RETRIES):
                 try:
-                    stream = await client.responses.create(
-                        model="gpt-5.4-nano-2026-03-17",
-                        instructions=MAIN_WIKI_AGENT_INSTRUCTIONS,
-                        max_tokens=4096,
-                        input=input_list
-                        + [
-                            {
-                                "role": "user",
-                                "content": (
-                                    "Use the tool results and messages above to answer the original request. "
-                                    "Do not ask for more tool calls."
-                                ),
-                            },
-                        ],
-                        tool_choice="none",
-                        stream=True,
-                        reasoning={"effort": "low"},
+                    async with asyncio.timeout(TURN_API_TIMEOUT):
+                        stream = await client.responses.create(
+                            model="gpt-5.4-nano-2026-03-17",
+                            instructions=MAIN_WIKI_AGENT_INSTRUCTIONS,
+                            max_tokens=4096,
+                            input=input_list
+                            + [
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "Use the tool results and messages above to answer the original request. "
+                                        "Do not ask for more tool calls."
+                                    ),
+                                },
+                            ],
+                            tool_choice="none",
+                            stream=True,
+                            reasoning={"effort": "low"},
+                        )
+                        closing_text = ""
+                        async for event in stream:
+                            event_type = _event_type(event)
+                            if event_type == "response.output_text.delta":
+                                delta = event["delta"] if isinstance(event, dict) else event.delta
+                                if isinstance(delta, str) and delta:
+                                    closing_text += delta
+                                    yield delta
+                            elif event_type == "response.output_text.done":
+                                final = (
+                                    event.get("text") if isinstance(event, dict) else getattr(event, "text", None)
+                                )
+                                if isinstance(final, str):
+                                    closing_text = final
+                                if closing_text.strip():
+                                    input_list.append({"role": "assistant", "content": closing_text})
+                            elif event_type in _RESPONSE_LIFECYCLE_EVENT_TYPES:
+                                _log_response_lifecycle(agent_id, "synthesis", event)
+                    return
+                except TimeoutError:
+                    logger.error(
+                        "synthesis turn exceeded TURN_API_TIMEOUT (agent_id=%s limit_s=%s attempt=%s)",
+                        agent_id,
+                        TURN_API_TIMEOUT,
+                        attempt + 1,
                     )
-                    break
+                    raise TimeoutError(
+                        f"Agent synthesis turn exceeded TURN_API_TIMEOUT "
+                        f"({TURN_API_TIMEOUT}s, agent_id={agent_id})"
+                    ) from None
                 except (APITimeoutError, InternalServerError, RateLimitError, APIConnectionError) as e:
                     if attempt < MAX_RETRIES - 1:
+                        logger.warning(
+                            "responses.create retry (phase=synthesis agent_id=%s attempt=%s/%s): %s",
+                            agent_id,
+                            attempt + 1,
+                            MAX_RETRIES,
+                            e,
+                        )
                         yield {
                             "type": "api_retry",
                             "code": getattr(e, "status_code", None),
@@ -272,22 +440,12 @@ async def run_agent_loop(
                         }
                         await asyncio.sleep(2**attempt)
                     else:
+                        logger.error(
+                            "synthesis turn max retries exhausted (agent_id=%s, last_error=%s)",
+                            agent_id,
+                            e,
+                        )
                         raise
-            closing_text = ""
-            async for event in stream:
-                event_type = _event_type(event)
-                if event_type == "response.output_text.delta":
-                    delta = event["delta"] if isinstance(event, dict) else event.delta
-                    if isinstance(delta, str) and delta:
-                        closing_text += delta
-                        yield delta
-                elif event_type == "response.output_text.done":
-                    final = event.get("text") if isinstance(event, dict) else getattr(event, "text", None)
-                    if isinstance(final, str):
-                        closing_text = final
-                    if closing_text.strip():
-                        input_list.append({"role": "assistant", "content": closing_text})
-            return
 
         current_output_text = ""
         tools_used_this_turn = False
@@ -295,18 +453,153 @@ async def run_agent_loop(
         stream = None
         for attempt in range(MAX_RETRIES):
             try:
-                stream = await client.responses.create(
-                    model="gpt-5.4-nano-2026-03-17",
-                    instructions=MAIN_WIKI_AGENT_INSTRUCTIONS,
-                    max_tokens=4096,
-                    tools=defs,
-                    input=input_list,
-                    stream=True,
-                    reasoning={"effort": "low"},
-                )
+                async with asyncio.timeout(TURN_API_TIMEOUT):
+                    stream = await client.responses.create(
+                        model="gpt-5.4-nano-2026-03-17",
+                        instructions=MAIN_WIKI_AGENT_INSTRUCTIONS,
+                        max_tokens=4096,
+                        tools=defs,
+                        input=input_list,
+                        stream=True,
+                        reasoning={"effort": "low"},
+                    )
+                    async for event in stream:
+                        event_type = _event_type(event)
+
+                        if event_type == "response.output_text.delta":
+                            delta = event["delta"] if isinstance(event, dict) else event.delta
+                            if isinstance(delta, str) and delta:
+                                current_output_text += delta
+                                yield delta
+
+                        elif event_type == "response.output_text.done":
+                            final = event.get("text") if isinstance(event, dict) else getattr(event, "text", None)
+                            if isinstance(final, str):
+                                current_output_text = final
+                            if current_output_text.strip():
+                                input_list.append({"role": "assistant", "content": current_output_text})
+
+                        elif event_type == "response.output_item.done":
+                            item = _event_item(event)
+                            itype = item["type"] if isinstance(item, dict) else getattr(item, "type", None)
+                            if itype != "function_call":
+                                continue
+                            tool_name = item["name"] if isinstance(item, dict) else item.name
+                            raw_args = item["arguments"] if isinstance(item, dict) else item.arguments
+                            call_id = item["call_id"] if isinstance(item, dict) else item.call_id
+
+                            if isinstance(raw_args, str):
+                                args_str = raw_args
+                                try:
+                                    tool_args = json.loads(args_str)
+                                except json.JSONDecodeError:
+                                    logger.warning(
+                                        "invalid tool arguments JSON (agent_id=%s tool=%s preview=%s)",
+                                        agent_id,
+                                        tool_name,
+                                        _log_preview(args_str, 120),
+                                    )
+                                    input_list.append(
+                                        {
+                                            "type": "function_call",
+                                            "name": tool_name,
+                                            "call_id": call_id,
+                                            "arguments": args_str,
+                                        }
+                                    )
+                                    input_list.append(
+                                        {
+                                            "type": "function_call_output",
+                                            "call_id": call_id,
+                                            "output": json.dumps(
+                                                {"error": "invalid_tool_arguments_json", "raw": args_str[:500]}
+                                            ),
+                                        }
+                                    )
+                                    tools_used_this_turn = True
+                                    continue
+                            else:
+                                tool_args = raw_args
+                                args_str = json.dumps(raw_args)
+
+                            logger.info(
+                                "tool call (agent_id=%s name=%s args_len=%s)",
+                                agent_id,
+                                tool_name,
+                                len(args_str),
+                            )
+                            input_list.append(
+                                {
+                                    "type": "function_call",
+                                    "name": tool_name,
+                                    "call_id": call_id,
+                                    "arguments": args_str,
+                                }
+                            )
+
+                            try:
+                                result = await asyncio.wait_for(
+                                    execute_tool(tool_name, tool_args, agent_id=agent_id, db=db),
+                                    timeout=TOOL_EXECUTION_TIMEOUT,
+                                )
+                            except asyncio.TimeoutError:
+                                logger.error(
+                                    "tool execution timeout (agent_id=%s tool=%s limit_s=%s)",
+                                    agent_id,
+                                    tool_name,
+                                    TOOL_EXECUTION_TIMEOUT,
+                                )
+                                input_list.append(
+                                    {
+                                        "type": "function_call_output",
+                                        "call_id": call_id,
+                                        "output": json.dumps({"error": "tool_execution_timeout"}),
+                                    }
+                                )
+                                tools_used_this_turn = True
+                                continue
+
+                            out = json.dumps(result)
+                            logger.info(
+                                "tool done (agent_id=%s tool=%s result_keys=%s out_len=%s)",
+                                agent_id,
+                                tool_name,
+                                list(result.keys()) if isinstance(result, dict) else type(result).__name__,
+                                len(out),
+                            )
+                            input_list.append(
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": call_id,
+                                    "output": out,
+                                }
+                            )
+                            if "result" in result:
+                                tool_rounds += 1
+                            tools_used_this_turn = True
+
+                        elif event_type in _RESPONSE_LIFECYCLE_EVENT_TYPES:
+                            _log_response_lifecycle(agent_id, "tool_turn", event)
                 break
+            except TimeoutError:
+                logger.error(
+                    "tool turn exceeded TURN_API_TIMEOUT (agent_id=%s limit_s=%s attempt=%s)",
+                    agent_id,
+                    TURN_API_TIMEOUT,
+                    attempt + 1,
+                )
+                raise TimeoutError(
+                    f"Agent tool turn exceeded TURN_API_TIMEOUT ({TURN_API_TIMEOUT}s, agent_id={agent_id})"
+                ) from None
             except (APITimeoutError, InternalServerError, RateLimitError, APIConnectionError) as e:
                 if attempt < MAX_RETRIES - 1:
+                    logger.warning(
+                        "responses.create/stream retry (phase=tool_turn agent_id=%s attempt=%s/%s): %s",
+                        agent_id,
+                        attempt + 1,
+                        MAX_RETRIES,
+                        e,
+                    )
                     yield {
                         "type": "api_retry",
                         "code": getattr(e, "status_code", None),
@@ -316,98 +609,14 @@ async def run_agent_loop(
                     }
                     await asyncio.sleep(2**attempt)
                 else:
+                    logger.error(
+                        "tool turn max retries exhausted (agent_id=%s last_error=%s)",
+                        agent_id,
+                        e,
+                    )
                     raise
 
-        async for event in stream:
-            event_type = _event_type(event)
-
-            if event_type == "response.output_text.delta":
-                delta = event["delta"] if isinstance(event, dict) else event.delta
-                if isinstance(delta, str) and delta:
-                    current_output_text += delta
-                    yield delta
-
-            elif event_type == "response.output_text.done":
-                final = event.get("text") if isinstance(event, dict) else getattr(event, "text", None)
-                if isinstance(final, str):
-                    current_output_text = final
-                if current_output_text.strip():
-                    input_list.append({"role": "assistant", "content": current_output_text})
-
-            elif event_type == "response.output_item.done":
-                item = _event_item(event)
-                itype = item["type"] if isinstance(item, dict) else getattr(item, "type", None)
-                if itype != "function_call":
-                    continue
-                tool_name = item["name"] if isinstance(item, dict) else item.name
-                raw_args = item["arguments"] if isinstance(item, dict) else item.arguments
-                call_id = item["call_id"] if isinstance(item, dict) else item.call_id
-
-                if isinstance(raw_args, str):
-                    args_str = raw_args
-                    try:
-                        tool_args = json.loads(args_str)
-                    except json.JSONDecodeError:
-                        input_list.append(
-                            {
-                                "type": "function_call",
-                                "name": tool_name,
-                                "call_id": call_id,
-                                "arguments": args_str,
-                            }
-                        )
-                        input_list.append(
-                            {
-                                "type": "function_call_output",
-                                "call_id": call_id,
-                                "output": json.dumps(
-                                    {"error": "invalid_tool_arguments_json", "raw": args_str[:500]}
-                                ),
-                            }
-                        )
-                        tools_used_this_turn = True
-                        continue
-                else:
-                    tool_args = raw_args
-                    args_str = json.dumps(raw_args)
-
-                input_list.append(
-                    {
-                        "type": "function_call",
-                        "name": tool_name,
-                        "call_id": call_id,
-                        "arguments": args_str,
-                    }
-                )
-
-                try:
-                    result = await asyncio.wait_for(
-                        execute_tool(tool_name, tool_args, agent_id=agent_id, db=db),
-                        timeout=TOOL_EXECUTION_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    input_list.append(
-                        {
-                            "type": "function_call_output",
-                            "call_id": call_id,
-                            "output": json.dumps({"error": "tool_execution_timeout"}),
-                        }
-                    )
-                    tools_used_this_turn = True
-                    continue
-
-                out = json.dumps(result)
-                input_list.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": out,
-                    }
-                )
-                if "result" in result:
-                    tool_rounds += 1
-                tools_used_this_turn = True
-
         if not tools_used_this_turn:
+            logger.info("agent loop end without tools (agent_id=%s)", agent_id)
             return
 
