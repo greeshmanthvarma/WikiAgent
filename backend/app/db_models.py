@@ -54,6 +54,20 @@ class SynthesisRunKind(str, enum.Enum):
     CONVERGENCE = "convergence"
 
 
+class SourceKind(str, enum.Enum):
+    UPLOAD_PDF = "upload_pdf"
+    UPLOAD_DOCX = "upload_docx"
+    UPLOAD_MARKDOWN = "upload_markdown"
+    UPLOAD_PLAIN_TEXT = "upload_plain_text"
+    URL_HTML = "url_html"
+
+
+class SourceStatus(str, enum.Enum):
+    PENDING = "pending"
+    READY = "ready"
+    FAILED = "failed"
+
+
 class UserModel(Base):
     """Registered user; owns agents, jobs, chats, and synthesis runs."""
 
@@ -164,14 +178,31 @@ class SourceModel(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False, index=True)
+    kind = Column(
+        SQLEnum(SourceKind, values_callable=lambda x: [e.value for e in x]),
+        nullable=False,
+    )
+    status = Column(
+        SQLEnum(SourceStatus, values_callable=lambda x: [e.value for e in x]),
+        nullable=False,
+        default=SourceStatus.PENDING,
+    )
+
     storage_key = Column(String, nullable=True)
+    source_url = Column(String, nullable=True)
     original_filename = Column(String, nullable=True)
     content_type = Column(String, nullable=True)
     byte_size = Column(Integer, nullable=True)
+
+    extracted_text = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    raw_sha256 = Column(String(64), nullable=True, index=True)
     sha256 = Column(String(64), nullable=True, index=True)
+
     extra = Column(JSONB, nullable=True)
 
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
     agent = relationship("AgentModel", back_populates="sources")
     jobs = relationship("JobModel", back_populates="source")

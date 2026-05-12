@@ -13,7 +13,7 @@ import os
 import asyncio
 from sqlalchemy import text
 import logging
-
+from app.routers import sources
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -22,7 +22,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-
+app.include_router(sources.router)
 cors_origins_env = os.getenv("CORS_ORIGINS", "http://localhost:5173")
 cors_origins = [origin.strip() for origin in cors_origins_env.split(",")]
 app.add_middleware(
